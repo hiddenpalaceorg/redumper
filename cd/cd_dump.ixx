@@ -13,6 +13,7 @@ module;
 #include <string>
 #include <vector>
 #include "throw_line.hh"
+#include <span>
 
 export module cd.dump;
 
@@ -543,6 +544,12 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, bool refine)
 
     SignalINT signal;
 
+    std::optional<int32_t> current_offset;
+    std::optional<int32_t> initial_offset;
+    std::vector<uint8_t> data_buffer;
+    std::vector<int32_t> lba_buffer;
+    const size_t SECTORS_TO_BUFFER = 2;
+
     int32_t lba_next = 0;
     int32_t lba_overread = lba_end;
     for(int32_t lba = lba_start; lba < lba_overread; lba = lba_next)
@@ -767,18 +774,16 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, bool refine)
             }
         }
 
-        if(store)
+        // some drives desync at a random sector
+        if(subcode)
         {
-            // some drives desync at a random sector
-            if(subcode)
+            ChannelQ Q;
+            subcode_extract_channel((uint8_t *)&Q, sector_subcode.data(), Subchannel::Q);
+            if(Q.isValid())
             {
-                ChannelQ Q;
-                subcode_extract_channel((uint8_t *)&Q, sector_subcode.data(), Subchannel::Q);
-                if(Q.isValid())
+                if(Q.adr == 1 && Q.mode1.tno)
                 {
-                    if(Q.adr == 1 && Q.mode1.tno)
-                    {
-                        int32_t lbaq = BCDMSF_to_LBA(Q.mode1.a_msf);
+                    int32_t lbaq = BCDMSF_to_LBA(Q.mode1.a_msf);
 
                         int32_t shift = lbaq - lba;
                         if(subcode_shift != shift)
@@ -789,6 +794,49 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, bool refine)
                     }
                 }
             }
+
+            if(Q.control & (uint8_t)ChannelQ::Control::DATA || Q.mode1.tno == 13)
+            {
+                data_buffer.insert(data_buffer.end(), sector_data.begin(), sector_data.end());
+                lba_buffer.push_back(lba);
+
+                if(lba_buffer.size() >= SECTORS_TO_BUFFER)
+                {
+                    auto new_offset = sector_offset_by_sync(std::span(data_buffer), lba_buffer.front());
+                    if(new_offset)
+                    {
+                        int32_t write_offset = -(*new_offset - ctx.drive_config.read_offset);
+
+                        if(!initial_offset)
+                        {
+                            initial_offset = write_offset;
+                            current_offset = write_offset;
+                            LOG_R("[LBA: {:6}] write offset detected: {:+}", lba, write_offset);
+                        }
+                        else if(write_offset != *current_offset)
+                        {
+                            LOG_R("[LBA: {:6}] write offset change: {:+} -> {:+}", lba, *current_offset, write_offset);
+                            current_offset = write_offset;
+
+                            if(write_offset != *initial_offset)
+                            {
+                                store = false;
+                                if(!refine)
+                                {
+                                    ++errors_scsi;
+                                }
+                            }
+                        }
+                    }
+
+                    data_buffer.erase(data_buffer.begin(), data_buffer.begin() + CD_DATA_SIZE);
+                    lba_buffer.erase(lba_buffer.begin());
+                }
+            }
+        }
+
+        if(store)
+        {
 
             if(refine)
             {
