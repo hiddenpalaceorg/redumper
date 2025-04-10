@@ -46,6 +46,7 @@ namespace gpsxre
 
 const uint32_t SLOW_SECTOR_TIMEOUT = 5;
 const uint32_t SUBCODE_BYTE_DESYNC_COUNT = 5;
+const uint32_t SECTORS_TO_BUFFER = 2;
 
 
 std::vector<Range<int32_t>> protection_to_ranges(std::span<const std::pair<int32_t, int32_t>> protection)
@@ -191,6 +192,70 @@ bool check_subcode_shift(int32_t &subcode_shift, int32_t lba, std::span<const ui
     return skip;
 }
 
+bool check_write_offset_change(int32_t lba, std::optional<int32_t> &initial_offset, std::optional<int32_t> &current_offset, int32_t read_offset, std::vector<uint8_t> data_buffer,
+    std::vector<int32_t> lba_buffer, std::span<const uint8_t> sector_subcode, std::span<const uint8_t> sector_data, const Options &options)
+{
+    bool skip = false;
+    if(!options.skip_write_offset_changes)
+    {
+        return skip;
+    }
+
+    ChannelQ Q = subcode_extract_q(sector_subcode.data());
+    if(Q.control & (uint8_t)ChannelQ::Control::DATA)
+    {
+        data_buffer.insert(data_buffer.end(), sector_data.begin(), sector_data.end());
+        lba_buffer.push_back(lba);
+
+        // Try to detect offset with just the current sector first
+        auto new_offset = sector_offset_by_sync(std::span(const_cast<uint8_t *>(sector_data.data()), sector_data.size()), lba);
+
+        // If we can't find the sync in a single sector, try with the buffered data
+        if(!new_offset && lba_buffer.size() >= SECTORS_TO_BUFFER)
+        {
+            new_offset = sector_offset_by_sync(std::span(data_buffer), lba_buffer.front());
+        }
+
+        if(new_offset)
+        {
+            int32_t write_offset = *new_offset - read_offset;
+
+            if(!initial_offset)
+            {
+                initial_offset = write_offset;
+                current_offset = write_offset;
+                if(options.verbose)
+                    LOG_R("[LBA: {:6}] write offset detected: {:+}", lba, write_offset);
+            }
+            else if(write_offset != *current_offset)
+            {
+                if(options.verbose)
+                    LOG_R("[LBA: {:6}] write offset change: {:+} -> {:+}", lba, *current_offset, write_offset);
+                current_offset = write_offset;
+            }
+        }
+
+        // Only keep the buffer if we still need it (no sync found in single sector)
+        if(!new_offset && lba_buffer.size() >= SECTORS_TO_BUFFER)
+        {
+            data_buffer.erase(data_buffer.begin(), data_buffer.begin() + CD_DATA_SIZE);
+            lba_buffer.erase(lba_buffer.begin());
+        }
+        else if(new_offset)
+        {
+            // Clear buffers if we found the sync
+            data_buffer.clear();
+            lba_buffer.clear();
+        }
+
+        if(!current_offset || current_offset != *initial_offset)
+        {
+            skip = true;
+        }
+    }
+    return skip;
+}
+
 
 void check_fix_byte_desync(Context &ctx, uint32_t &subcode_byte_desync_counter, int32_t lba, std::span<const uint8_t> sector_subcode)
 {
@@ -308,6 +373,11 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, DumpMode dump
     std::vector<uint8_t> sector_protection_d(CD_DATA_SIZE_SAMPLES);
     std::vector<uint8_t> sector_subcode_file(CD_SUBCODE_SIZE);
 
+    std::optional<int32_t> current_offset;
+    std::optional<int32_t> initial_offset;
+    std::vector<uint8_t> data_buffer;
+    std::vector<int32_t> lba_buffer;
+
     int32_t data_drive_offset = ctx.drive_config.read_offset;
     if(options.dump_write_offset)
         data_drive_offset = -*options.dump_write_offset;
@@ -316,6 +386,8 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, DumpMode dump
         auto disc_offset = find_disc_offset(toc, fs_state, fs_scram);
         if(disc_offset)
         {
+            initial_offset = disc_offset;
+            current_offset = disc_offset;
             data_drive_offset = -*disc_offset;
             LOG("disc write offset: {:+}", *disc_offset);
             LOG("");
@@ -370,6 +442,7 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, DumpMode dump
         read_entry(fs_state, (uint8_t *)sector_state_file_d.data(), CD_DATA_SIZE_SAMPLES, lba_index, 1, data_drive_offset, (uint8_t)State::ERROR_SKIP);
         read_entry(fs_subcode, sector_subcode_file.data(), CD_SUBCODE_SIZE, lba_index, 1, 0, 0);
 
+
         if(sector_data_complete(sector_state_file_a, sector_protection_a) && sector_data_complete(sector_state_file_d, sector_protection_d)
             && (!options.refine_subchannel || subcode_extract_q(sector_subcode_file.data()).isValid()))
             continue;
@@ -421,7 +494,8 @@ export bool redumper_dump_cd(Context &ctx, const Options &options, DumpMode dump
                 break;
             }
 
-            if(status.status_code || check_subcode_shift(subcode_shift, lba, sector_subcode, options))
+            if(status.status_code || check_subcode_shift(subcode_shift, lba, sector_subcode, options)
+                || check_write_offset_change(lba, initial_offset, current_offset, ctx.drive_config.read_offset, data_buffer, lba_buffer, sector_subcode, sector_data, options))
             {
                 if(protection_range == nullptr && lba < lba_end)
                 {
